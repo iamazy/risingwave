@@ -18,13 +18,14 @@ use risingwave_pb::batch_plan::plan_node::NodeBody;
 use risingwave_pb::batch_plan::PlanNode;
 
 use crate::executor2::{
-    BoxedExecutor2, BoxedExecutor2Builder, DeleteExecutor2, ExchangeExecutor2, FilterExecutor2,
-    GenerateSeriesExecutor2Builder, HashAggExecutor2Builder, HashJoinExecutor2Builder,
-    HopWindowExecutor2, InsertExecutor2, LimitExecutor2, MergeSortExchangeExecutor2,
-    NestedLoopJoinExecutor2, OrderByExecutor2, ProjectExecutor2, RowSeqScanExecutor2Builder,
-    SortAggExecutor2, SortMergeJoinExecutor2, TopNExecutor2, TraceExecutor2, ValuesExecutor2,
+    BoxedExecutor2, BoxedExecutor2Builder, DeleteExecutor2, FilterExecutor2,
+    GenerateSeriesExecutor2Wrapper, GenericExchangeExecutor2Builder, HashAggExecutor2Builder,
+    HashJoinExecutor2Builder, HopWindowExecutor2, InsertExecutor2, LimitExecutor2,
+    MergeSortExchangeExecutor2Builder, NestedLoopJoinExecutor2, OrderByExecutor2, ProjectExecutor2,
+    RowSeqScanExecutor2Builder, SortAggExecutor2, SortMergeJoinExecutor2, TopNExecutor2,
+    TraceExecutor2, ValuesExecutor2,
 };
-use crate::task::{BatchEnvironment, TaskId};
+use crate::task::{BatchTaskContext, TaskId};
 
 #[cfg(test)]
 pub mod test_utils;
@@ -32,22 +33,26 @@ pub mod test_utils;
 /// Every Executor should impl this trait to provide a static method to build a `BoxedExecutor` from
 /// proto and global environment
 pub trait BoxedExecutorBuilder {
-    fn new_boxed_executor2(source: &ExecutorBuilder) -> Result<BoxedExecutor2>;
+    fn new_boxed_executor2<C: BatchTaskContext>(
+        source: &ExecutorBuilder<C>,
+    ) -> Result<BoxedExecutor2>;
 }
 
 #[allow(dead_code)]
 struct NotImplementedBuilder;
 
 impl BoxedExecutorBuilder for NotImplementedBuilder {
-    fn new_boxed_executor2(_source: &ExecutorBuilder) -> Result<BoxedExecutor2> {
+    fn new_boxed_executor2<C: BatchTaskContext>(
+        _source: &ExecutorBuilder<C>,
+    ) -> Result<BoxedExecutor2> {
         Err(ErrorCode::NotImplemented("Executor not implemented".to_string(), None.into()).into())
     }
 }
 
-pub struct ExecutorBuilder<'a> {
+pub struct ExecutorBuilder<'a, C> {
     pub plan_node: &'a PlanNode,
     pub task_id: &'a TaskId,
-    env: BatchEnvironment,
+    context: C,
     epoch: u64,
 }
 
@@ -63,17 +68,12 @@ macro_rules! build_executor2 {
     }
 }
 
-impl<'a> ExecutorBuilder<'a> {
-    pub fn new(
-        plan_node: &'a PlanNode,
-        task_id: &'a TaskId,
-        env: BatchEnvironment,
-        epoch: u64,
-    ) -> Self {
+impl<'a, C: BatchTaskContext> ExecutorBuilder<'a, C> {
+    pub fn new(plan_node: &'a PlanNode, task_id: &'a TaskId, context: C, epoch: u64) -> Self {
         Self {
             plan_node,
             task_id,
-            env,
+            context,
             epoch,
         }
     }
@@ -91,7 +91,7 @@ impl<'a> ExecutorBuilder<'a> {
 
     #[must_use]
     pub fn clone_for_plan(&self, plan_node: &'a PlanNode) -> Self {
-        ExecutorBuilder::new(plan_node, self.task_id, self.env.clone(), self.epoch)
+        ExecutorBuilder::new(plan_node, self.task_id, self.context.clone(), self.epoch)
     }
 
     fn try_build2(&self) -> Result<BoxedExecutor2> {
@@ -99,7 +99,7 @@ impl<'a> ExecutorBuilder<'a> {
             NodeBody::RowSeqScan => RowSeqScanExecutor2Builder,
             NodeBody::Insert => InsertExecutor2,
             NodeBody::Delete => DeleteExecutor2,
-            NodeBody::Exchange => ExchangeExecutor2,
+            NodeBody::Exchange => GenericExchangeExecutor2Builder,
             NodeBody::Filter => FilterExecutor2,
             NodeBody::Project => ProjectExecutor2,
             NodeBody::SortAgg => SortAggExecutor2,
@@ -111,6 +111,8 @@ impl<'a> ExecutorBuilder<'a> {
             NodeBody::HashJoin => HashJoinExecutor2Builder,
             NodeBody::SortMergeJoin => SortMergeJoinExecutor2,
             NodeBody::HashAgg => HashAggExecutor2Builder,
+            NodeBody::MergeSortExchange => MergeSortExchangeExecutor2Builder,
+            NodeBody::GenerateSeries => GenerateSeriesExecutor2Wrapper,
             NodeBody::MergeSortExchange => MergeSortExchangeExecutor2,
             NodeBody::GenerateSeries => GenerateSeriesExecutor2Builder,
             NodeBody::HopWindow => HopWindowExecutor2,
@@ -123,8 +125,8 @@ impl<'a> ExecutorBuilder<'a> {
         self.plan_node
     }
 
-    pub fn global_batch_env(&self) -> &BatchEnvironment {
-        &self.env
+    pub fn batch_task_context(&self) -> &C {
+        &self.context
     }
 
     pub fn epoch(&self) -> u64 {
@@ -137,7 +139,7 @@ mod tests {
     use risingwave_pb::batch_plan::PlanNode;
 
     use crate::executor::ExecutorBuilder;
-    use crate::task::{BatchEnvironment, TaskId};
+    use crate::task::{ComputeNodeContext, TaskId};
 
     #[test]
     fn test_clone_for_plan() {
@@ -149,8 +151,12 @@ mod tests {
             stage_id: 1,
             query_id: "test_query_id".to_string(),
         };
-        let builder =
-            ExecutorBuilder::new(&plan_node, task_id, BatchEnvironment::for_test(), u64::MAX);
+        let builder = ExecutorBuilder::new(
+            &plan_node,
+            task_id,
+            ComputeNodeContext::new_for_test(),
+            u64::MAX,
+        );
         let child_plan = &PlanNode {
             ..Default::default()
         };
